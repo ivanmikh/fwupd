@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2020 Aleksander Morgado <aleksander@aleksander.es>
  * Copyright (C) 2021 Quectel Wireless Solutions Co., Ltd.
+ *                    Ivan Mikhanchuk <ivan.mikhanchuk@quectel.com>
  *
  * SPDX-License-Identifier: LGPL-2.1+
  */
@@ -52,6 +53,7 @@
 struct _FuFirehoseUpdater {
 	GObject parent_instance;
 	gchar *port;
+	FuSaharaLoader *sahara;
 	FuIOChannel *io_channel;
 };
 
@@ -74,6 +76,33 @@ fu_firehose_updater_log_message(const gchar *action, GBytes *msg)
 	msg_strsafe = fu_common_strsafe(msg_data, msg_size);
 
 	g_debug("%s: %.*s", action, (gint)msg_size, msg_strsafe);
+}
+static GBytes *
+fu_firehose_read(FuFirehoseUpdater *self, guint timeout_ms, FuIOChannelFlags flags, GError **error)
+{
+	if (self->sahara != NULL) {
+		GByteArray *bytearr = NULL;
+		g_autoptr(GBytes) bytes = NULL;
+
+		bytearr = fu_sahara_loader_qdl_read(self->sahara, error);
+		if (bytearr == NULL)
+			return FALSE;
+
+		bytes = g_bytes_new_take (bytearr->data, bytearr->len);
+		return g_steal_pointer(&bytes);
+	} else
+		return fu_io_channel_read_bytes(self->io_channel, -1, timeout_ms, flags, error);
+}
+
+static gboolean
+fu_firehose_write(FuFirehoseUpdater *self, GBytes *bytes, guint timeout_ms, FuIOChannelFlags flags, GError **error)
+{
+	if (self->sahara != NULL) {
+		gsize sz;
+		const guint8 *data = g_bytes_get_data(bytes, &sz);
+		return fu_sahara_loader_qdl_write(self->sahara, data, sz, error);
+	} else
+		return fu_io_channel_write_bytes(self->io_channel, bytes, timeout_ms, flags, error);
 }
 
 static gboolean
@@ -189,15 +218,21 @@ gboolean
 fu_firehose_updater_open(FuFirehoseUpdater *self, GError **error)
 {
 	g_debug("opening firehose port...");
-	self->io_channel = fu_io_channel_new_file(self->port, error);
-	return (self->io_channel != NULL);
+	if (self->port != NULL) {
+		self->io_channel = fu_io_channel_new_file(self->port, error);
+		return (self->io_channel != NULL);
+	} else if (fu_sahara_loader_qdl_is_open(self->sahara))
+		return TRUE;
+
+	g_set_error(error, G_IO_ERR, G_IO_ERROR, "No device to write firehose commands to");
+	return FALSE;
 }
 
 gboolean
 fu_firehose_updater_close(FuFirehoseUpdater *self, GError **error)
 {
 	g_debug("closing firehose port...");
-	if (!fu_io_channel_shutdown(self->io_channel, error))
+	if (self->io_channel != NULL && !fu_io_channel_shutdown(self->io_channel, error))
 		return FALSE;
 	g_clear_object(&self->io_channel);
 	return TRUE;
@@ -288,11 +323,7 @@ fu_firehose_updater_send_and_receive(FuFirehoseUpdater *self,
 		cmd_bytes = g_byte_array_free_to_bytes(take_cmd_bytearray);
 
 		fu_firehose_updater_log_message("writing", cmd_bytes);
-		if (!fu_io_channel_write_bytes(self->io_channel,
-					       cmd_bytes,
-					       1500,
-					       FU_IO_CHANNEL_FLAG_FLUSH_INPUT,
-					       error)) {
+		if (!fu_firehose_write(self, cmd_bytes, 1500, FU_IO_CHANNEL_FLAG_FLUSH_INPUT, error)) {
 			g_prefix_error(error, "Failed to write command: ");
 			return FALSE;
 		}
@@ -303,11 +334,8 @@ fu_firehose_updater_send_and_receive(FuFirehoseUpdater *self,
 		g_autoptr(XbSilo) silo = NULL;
 		g_autoptr(XbNode) response_node = NULL;
 
-		rsp_bytes = fu_io_channel_read_bytes(self->io_channel,
-						     -1,
-						     DEFAULT_RECV_TIMEOUT_MS,
-						     FU_IO_CHANNEL_FLAG_SINGLE_SHOT,
-						     error);
+		rsp_bytes = fu_firehose_read(self, DEFAULT_RECV_TIMEOUT_MS,
+					     FU_IO_CHANNEL_FLAG_SINGLE_SHOT, error);
 		if (rsp_bytes == NULL) {
 			g_prefix_error(error, "Failed to read XML message: ");
 			return FALSE;
@@ -345,14 +373,10 @@ fu_firehose_updater_initialize(FuFirehoseUpdater *self, GError **error)
 	guint n_msg = 0;
 
 	for (guint i = 0; i < MAX_RECV_MESSAGES; i++) {
+		guint timeout = (i == 0 ? INITIALIZE_INITIAL_TIMEOUT_MS : INITIALIZE_TIMEOUT_MS);
 		g_autoptr(GBytes) rsp_bytes = NULL;
 
-		rsp_bytes = fu_io_channel_read_bytes(
-		    self->io_channel,
-		    -1,
-		    (i == 0 ? INITIALIZE_INITIAL_TIMEOUT_MS : INITIALIZE_TIMEOUT_MS),
-		    FU_IO_CHANNEL_FLAG_SINGLE_SHOT,
-		    NULL);
+		rsp_bytes = fu_firehose_read(self, timeout, FU_IO_CHANNEL_FLAG_SINGLE_SHOT, NULL);
 		if (rsp_bytes == NULL)
 			break;
 
@@ -488,17 +512,22 @@ fu_firehose_updater_send_program_file(FuFirehoseUpdater *self,
 	FuChunk *chk;
 
 	chunks = fu_chunk_array_new_from_bytes(program_file, 0, 0, payload_size);
-	/* last block needs to be padded to the next payload_size,
+	/* last block needs to be padded to the next sector_size,
 	 * so that we always send full sectors */
 	chk = g_ptr_array_index(chunks, chunks->len - 1);
-	if (fu_chunk_get_data_sz(chk) != payload_size) {
+	if ((fu_chunk_get_data_sz(chk) % sector_size) != 0) {
 		g_autoptr(GBytes) padded_bytes = NULL;
-		g_autofree guint8 *padded_block = g_malloc0(payload_size);
+		g_autofree guint8 *padded_block = NULL;
+		gsize padded_sz = sector_size * (fu_chunk_get_data_sz(chk) / sector_size + 1);
+
+		padded_block = g_malloc0(padded_sz);
 		g_return_val_if_fail(padded_block != NULL, FALSE);
+
 		memcpy(padded_block, fu_chunk_get_data(chk), fu_chunk_get_data_sz(chk));
-		padded_bytes = g_bytes_new(padded_block, payload_size);
+		padded_bytes = g_bytes_new(padded_block, padded_sz);
 		fu_chunk_set_bytes(chk, padded_bytes);
-		g_return_val_if_fail(fu_chunk_get_data_sz(chk) == payload_size, FALSE);
+
+		g_return_val_if_fail(fu_chunk_get_data_sz(chk) == padded_sz, FALSE);
 	}
 	for (guint i = 0; i < chunks->len; i++) {
 		chk = g_ptr_array_index(chunks, i);
@@ -511,11 +540,8 @@ fu_firehose_updater_send_program_file(FuFirehoseUpdater *self,
 				chunks->len,
 				program_filename);
 
-		if (!fu_io_channel_write_bytes(self->io_channel,
-					       fu_chunk_get_bytes(chk),
-					       1500,
-					       FU_IO_CHANNEL_FLAG_FLUSH_INPUT,
-					       error)) {
+		if (!fu_firehose_write(self, fu_chunk_get_bytes(chk), 1500,
+				       FU_IO_CHANNEL_FLAG_FLUSH_INPUT, error)) {
 			g_prefix_error(error,
 				       "Failed to write block %u/%u of file '%s': ",
 				       i + 1,
@@ -647,7 +673,7 @@ fu_firehose_updater_run_action_program(FuFirehoseUpdater *self,
 		return FALSE;
 	}
 
-	while ((payload_size + (guint)program_sector_size) < max_payload_size)
+	while ((payload_size + (guint)program_sector_size) <= max_payload_size)
 		payload_size += (guint)program_sector_size;
 
 	g_debug("sending program file '%s' (%zu bytes)",
@@ -836,9 +862,11 @@ fu_firehose_updater_class_init(FuFirehoseUpdaterClass *klass)
 }
 
 FuFirehoseUpdater *
-fu_firehose_updater_new(const gchar *port)
+fu_firehose_updater_new(const gchar *port, FuSaharaLoader *sahara)
 {
 	FuFirehoseUpdater *self = g_object_new(FU_TYPE_FIREHOSE_UPDATER, NULL);
-	self->port = g_strdup(port);
+	if (port != NULL)
+		self->port = g_strdup(port);
+	self->sahara = sahara;
 	return self;
 }

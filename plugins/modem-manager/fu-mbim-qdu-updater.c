@@ -153,6 +153,12 @@ fu_mbim_qdu_updater_close(FuMbimQduUpdater *self, GError **error)
 	if (ctx.mbim_device == NULL)
 		return TRUE;
 
+	/* check if device is still present */
+	if (access(self->mbim_port, W_OK) != 0) {
+		g_clear_object(&ctx.mbim_device);
+		return TRUE;
+	};
+
 	mbim_device_close(ctx.mbim_device,
 			  5,
 			  NULL,
@@ -490,6 +496,12 @@ fu_mbim_qdu_updater_write(FuMbimQduUpdater *self,
 	}
 
 	return g_steal_pointer(&digest);
+}
+
+MbimDevice *
+fu_mbim_qdu_updater_get_mbim_device(FuMbimQduUpdater *self)
+{
+	return self->mbim_device;
 }
 
 static void
