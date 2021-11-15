@@ -189,6 +189,8 @@ fu_mm_utils_find_device_file(const gchar *device_sysfs_path,
 		return FALSE;
 	}
 
+	g_debug("found device: %s", device_file);
+
 	*out_device_file = g_steal_pointer(&device_file);
 
 	return TRUE;
